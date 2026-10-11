@@ -23,9 +23,9 @@ public final class SmokeInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
-            activity = startActivitySync(new Intent(getTargetContext(), MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            activity = startActivitySync(new Intent(getTargetContext(), MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
             waitForIdleSync();
-            if (test.equals("usage")) usageTest(); else uiTest();
+            if (test.equals("usage")) usageTest(); else if (test.equals("update")) updateTest(); else if (test.equals("installed") || test.equals("data")) installedTest(test.equals("installed")); else uiTest();
             result.putString("stream", "PASS " + test + ": " + checks + " checks\n"); finish(Activity.RESULT_OK, result);
         } catch (Throwable e) { result.putString("stream", "FAIL " + test + ": " + android.util.Log.getStackTraceString(e)); finish(Activity.RESULT_CANCELED, result); }
     }
@@ -96,6 +96,61 @@ public final class SmokeInstrumentation extends Instrumentation {
         store.change(s -> { for (StarState.Rule r : s.rules) if (r.id.equals(rule.id)) r.end = System.currentTimeMillis(); });
         check(store.snapshot().rules.get(store.snapshot().rules.size() - 1).end != 0, "stop rule preserves history");
     }
+    private void fixture(String scenario) throws Exception {
+        java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(BuildConfig.UPDATE_TEST_URL.replace("/latest", "/control?scenario=" + scenario)).openConnection();
+        c.setConnectTimeout(3000); c.setReadTimeout(3000); check(c.getResponseCode() == 200, "fixture configured"); c.getInputStream().close(); c.disconnect();
+    }
+    private void updateTest() throws Exception {
+        check(BuildConfig.DEBUG && !BuildConfig.UPDATE_TEST_URL.isEmpty() && BuildConfig.VERSION_CODE == 1, "uses emulator fixture build");
+        java.nio.file.Files.deleteIfExists(new java.io.File(getTargetContext().getFilesDir(), "updates/update.apk").toPath());
+        getTargetContext().getSharedPreferences("app-update", android.content.Context.MODE_PRIVATE).edit().clear().commit();
+        ManualUpdater updater = new ManualUpdater(getTargetContext());
+        fixture("missing_apk");
+        boolean missing = false; try { updater.check(); } catch (Exception expected) { missing = expected.getMessage().contains("没有 star-collect.apk"); } check(missing, "missing APK refused");
+        fixture("bad_digest"); ReleasePolicy.Release corrupt = updater.check();
+        boolean corruptRejected = false; String corruptError = "none"; try { updater.download(corrupt, ignored -> {}); } catch (Exception expected) { corruptError = android.util.Log.getStackTraceString(expected); corruptRejected = expected.getMessage().contains("校验失败"); }
+        check(corruptRejected && !new java.io.File(getTargetContext().getFilesDir(), "updates/update.apk").exists(), "corrupt digest refused without ready APK: " + corruptError);
+        fixture("bad_signer"); ReleasePolicy.Release foreign = updater.check();
+        boolean signerRejected = false; String signerError = "none"; try { updater.download(foreign, ignored -> {}); } catch (Exception expected) { signerError = android.util.Log.getStackTraceString(expected); signerRejected = expected.getMessage().contains("签名"); }
+        check(signerRejected && !new java.io.File(getTargetContext().getFilesDir(), "updates/update.apk").exists(), "foreign signing key refused: " + signerError);
+        fixture("good");
+        java.io.File valid = updater.download(updater.check(), ignored -> {}); check(valid.isFile(), "valid APK download and signature accepted"); valid.delete();
+        click("⚙  家长空间"); runOnMainSync(() -> fields().get(0).setText("1357")); click("保存");
+        click("检查应用更新"); check(findText("检查更新") != null, "parent manual update dialog");
+        click("检查更新"); awaitText("下载新版"); check(findText("下载新版") != null, "new version available");
+        click("下载新版"); awaitText("安装新版");
+        check(new java.io.File(getTargetContext().getFilesDir(), "updates/update.apk").isFile(), "verified APK persisted");
+        check(StateStore.get(getTargetContext()).snapshot().balance() == 3, "download leaves wallet intact");
+        updater.validate(new java.io.File(getTargetContext().getFilesDir(), "updates/update.apk"), "0.1.1"); checks++;
+        boolean readonly = false;
+        try { getTargetContext().getContentResolver().openFileDescriptor(UpdateProvider.URI, "w"); } catch (java.io.FileNotFoundException expected) { readonly = true; }
+        check(readonly, "installer provider is read only");
+        if (!getTargetContext().getPackageManager().canRequestPackageInstalls()) {
+            click("安装新版");
+            check(awaitPackage("settings"), "unknown-source permission page opened");
+            try (android.os.ParcelFileDescriptor ignored = getUiAutomation().executeShellCommand("appops set com.starcollect.app REQUEST_INSTALL_PACKAGES allow")) { Thread.sleep(300); }
+            sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK); Thread.sleep(500); waitForIdleSync();
+            click("安装新版"); runOnMainSync(() -> fields().get(0).setText("1357")); click("保存");
+        } else click("安装新版");
+        check(awaitPackage("packageinstaller"), "system installer requires explicit confirmation");
+    }
+    private boolean awaitPackage(String part) throws Exception { for (int i = 0; i < 50; i++) { android.view.accessibility.AccessibilityNodeInfo root = getUiAutomation().getRootInActiveWindow(); if (root != null && root.getPackageName().toString().contains(part)) return true; Thread.sleep(100); } return false; }
+    private void installedTest(boolean checkPublic) throws Exception {
+        StarState state = StateStore.get(getTargetContext()).snapshot();
+        check(state.balance() == 3, "wallet survived system update");
+        check(state.tasks.size() == 7 && state.tasks.stream().anyMatch(t -> t.title.equals("测试任务")), "custom task survived system update");
+        check(state.completions.size() == 1 && state.completions.get(0).approved, "approval survived system update");
+        check(ParentPin.verify(state, "1357"), "parent PIN survived system update");
+        check(state.rules.size() == 2 && state.rules.get(1).end != 0, "usage rule history survived system update");
+        check(getTargetContext().getPackageManager().getPackageInfo(getTargetContext().getPackageName(), 0).versionName.equals(BuildConfig.VERSION_NAME), "installed version matches published build");
+        check(BuildConfig.UPDATE_TEST_URL.isEmpty(), "normal build has no fixture URL");
+        if (!checkPublic) return;
+        ReleasePolicy.Release release = new ManualUpdater(getTargetContext()).check();
+        check(release != null && release.version.toString().equals(BuildConfig.VERSION_NAME), "public HTTPS release returns installed version");
+        click("⚙  家长空间"); runOnMainSync(() -> fields().get(0).setText("1357")); click("保存");
+        click("检查应用更新"); click("检查更新"); awaitText("当前已经是最新版本。");
+    }
+    private void awaitText(String value) throws Exception { for (int i = 0; i < 100 && findText(value) == null; i++) Thread.sleep(100); waitForIdleSync(); TextView message = (TextView) activity.getWindow().getDecorView().findViewById(android.R.id.message); if (message == null) for (View root : roots()) { message = root.findViewById(android.R.id.message); if (message != null) break; } check(findText(value) != null, "update UI reached " + value + ": " + (message == null ? "no message" : message.getText())); }
     private void check(boolean condition, String message) { if (!condition) throw new AssertionError(message); checks++; }
     private void awaitRules(StateStore store, int size) throws Exception { for (int i = 0; i < 30 && store.snapshot().rules.size() < size; i++) Thread.sleep(100); check(store.snapshot().rules.size() == size, "rule mutation completed"); Thread.sleep(150); waitForIdleSync(); }
     private void click(String text) throws Exception {

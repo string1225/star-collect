@@ -48,6 +48,10 @@ public final class MainActivity extends Activity {
     private long parentUntil;
     private boolean wide, syncing, resumed, dialogOpen;
     private String historyDay;
+    private AlertDialog updateDialog;
+    private ReleasePolicy.Release updateRelease;
+    private String updateMessage = "点击检查更新，查看是否有可安装的新版本。";
+    private boolean updateBusy;
     private final Runnable refresh = new Runnable() {
         @Override public void run() { if (resumed) { syncUsage(); handler.postDelayed(this, 60_000); } }
     };
@@ -62,6 +66,7 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume(); resumed = true;
         if (store != null) { render(); handler.removeCallbacks(refresh); handler.post(refresh); }
+        refreshUpdateDialog();
     }
     @Override protected void onStop() { super.onStop(); resumed = false; parentUntil = 0; handler.removeCallbacks(refresh); if (page == 3) page = 0; }
     @Override protected void onDestroy() { handler.removeCallbacks(refresh); executor.shutdown(); super.onDestroy(); }
@@ -285,8 +290,77 @@ public final class MainActivity extends Activity {
         content.addView(button("导出本机记录（JSON）", () -> gate(() -> {
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/json").putExtra(Intent.EXTRA_TITLE, "star-collect-" + today() + ".json"); startActivityForResult(intent, 100);
         }), false));
-        gap(content, 12); content.addView(note("记录只保存在本机。卸载或清除应用数据会删除记录；导出文件用于留档，首版暂不支持导入。请家长在首次使用时设置 PIN，并记住它。"));
+        gap(content, 18); content.addView(section("应用更新", "当前版本 " + BuildConfig.VERSION_NAME + " · 由家长手动检查和安装"));
+        content.addView(button("检查应用更新", () -> gate(this::showUpdateDialog), false));
+        gap(content, 12); content.addView(note("记录只保存在本机。覆盖更新会保留记录；卸载或清除应用数据会删除记录。导出文件用于留档，首版暂不支持导入。请家长记住 PIN。"));
     }
+    private void showUpdateDialog() {
+        updateDialog = new AlertDialog.Builder(this).setTitle("应用更新 · 当前 " + BuildConfig.VERSION_NAME)
+                .setMessage(updateMessage).setPositiveButton("检查更新", null).setNegativeButton("关闭", null).create();
+        dialogOpen = true; updateDialog.setOnDismissListener(d -> { updateDialog = null; dialogOpen = false; }); updateDialog.show();
+        updateDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> gate(() -> {
+            if (readyVersion() != null) installUpdate();
+            else if (updateRelease != null && updateRelease.version.compareTo(ReleasePolicy.Version.parse(BuildConfig.VERSION_NAME)) > 0) downloadUpdate();
+            else checkUpdate();
+        })); refreshUpdateDialog();
+    }
+    private String readyVersion() {
+        String version = getSharedPreferences("app-update", MODE_PRIVATE).getString("readyVersion", null);
+        if (version == null || !new java.io.File(getFilesDir(), "updates/update.apk").isFile()) return null;
+        try { if (ReleasePolicy.Version.parse(version).compareTo(ReleasePolicy.Version.parse(BuildConfig.VERSION_NAME)) > 0) return version; } catch (IllegalArgumentException ignored) { }
+        getSharedPreferences("app-update", MODE_PRIVATE).edit().remove("readyVersion").apply(); return null;
+    }
+    private void refreshUpdateDialog() {
+        if (updateDialog == null || !updateDialog.isShowing()) return;
+        String ready = readyVersion(); updateDialog.setMessage(ready != null && !updateBusy ? "新版 " + ready + " 已下载并校验，可以覆盖安装。\n\n安装需要安卓系统确认，星星、任务和家长 PIN 会保留。" : updateMessage);
+        Button action = updateDialog.getButton(AlertDialog.BUTTON_POSITIVE); if (action == null) return;
+        action.setEnabled(!updateBusy);
+        action.setText(updateBusy ? "请稍候…" : ready != null ? "安装新版" : updateRelease != null && updateRelease.version.compareTo(ReleasePolicy.Version.parse(BuildConfig.VERSION_NAME)) > 0 ? "下载新版" : "检查更新");
+    }
+    private void checkUpdate() {
+        if (updateBusy) return; updateBusy = true; updateMessage = "正在检查新版本…"; refreshUpdateDialog();
+        executor.submit(() -> {
+            try {
+                ReleasePolicy.Release release = new ManualUpdater(this).check();
+                handler.post(() -> {
+                    updateBusy = false; updateRelease = release;
+                    updateMessage = release == null ? "暂时没有已发布的更新。" : release.version.compareTo(ReleasePolicy.Version.parse(BuildConfig.VERSION_NAME)) <= 0 ? "当前已经是最新版本。" : "发现新版 " + release.version + "（" + String.format(Locale.CHINA, "%.1f", release.asset.size / 1048576.0) + " MB）\n\n" + release.notes + "\n\n点击下载后，再由您确认安装。";
+                    refreshUpdateDialog();
+                });
+            } catch (Exception e) { updateFailure(e); }
+        });
+    }
+    private void downloadUpdate() {
+        if (updateBusy || updateRelease == null) return; ReleasePolicy.Release release = updateRelease;
+        updateBusy = true; updateMessage = "正在下载新版… 0%"; refreshUpdateDialog();
+        executor.submit(() -> {
+            try {
+                new ManualUpdater(this).download(release, percent -> handler.post(() -> { updateMessage = "正在下载新版… " + percent + "%"; refreshUpdateDialog(); }));
+                getSharedPreferences("app-update", MODE_PRIVATE).edit().putString("readyVersion", release.version.toString()).commit();
+                handler.post(() -> { updateBusy = false; refreshUpdateDialog(); if (resumed && !isFinishing()) toast("新版已下载，请点击安装新版"); });
+            } catch (Exception e) { updateFailure(e); }
+        });
+    }
+    private void installUpdate() {
+        String version = readyVersion(); if (version == null) return;
+        if (!getPackageManager().canRequestPackageInstalls()) {
+            updateMessage = "请开启「允许来自此来源的应用」，返回后再次点击安装新版。";
+            try { startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()))); }
+            catch (RuntimeException e) { toast("请在系统设置中允许攒星星安装应用"); }
+            return;
+        }
+        updateBusy = true; refreshUpdateDialog();
+        executor.submit(() -> {
+            try {
+                new ManualUpdater(this).validate(new java.io.File(getFilesDir(), "updates/update.apk"), version);
+                handler.post(() -> { updateBusy = false; refreshUpdateDialog(); if (!resumed || isFinishing()) return;
+                    gate(() -> { try { startActivity(new Intent(Intent.ACTION_VIEW).setDataAndType(UpdateProvider.URI, "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)); }
+                        catch (RuntimeException e) { toast("无法打开系统安装界面：" + e.getMessage()); } });
+                });
+            } catch (Exception e) { getSharedPreferences("app-update", MODE_PRIVATE).edit().remove("readyVersion").commit(); updateFailure(e); }
+        });
+    }
+    private void updateFailure(Exception e) { handler.post(() -> { updateBusy = false; updateMessage = e.getMessage() == null ? "更新失败，请重试" : e.getMessage(); refreshUpdateDialog(); }); }
     private void approve(StarState.Completion target) {
         gate(() -> { mutate(s -> { StarState.Completion c = s.completion(target.taskId, target.day); if (c != null) s.approve(c, System.currentTimeMillis()); }); toast("奖励已到账  +" + target.stars + " ★"); });
     }

@@ -7,9 +7,30 @@ android {
         applicationId = 'com.starcollect.app'
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = '0.1.0'
+        versionCode = Integer.parseInt(providers.gradleProperty('appVersionCode').getOrElse('2'))
+        versionName = providers.gradleProperty('appVersionName').getOrElse('0.1.1')
         testInstrumentationRunner = 'com.starcollect.app.SmokeInstrumentation'
+    }
+    buildFeatures { buildConfig = true }
+    signingConfigs {
+        release {
+            def keyPath = System.getenv('STAR_COLLECT_KEYSTORE')
+            if (keyPath) {
+                storeFile = file(keyPath)
+                storePassword = System.getenv('STAR_COLLECT_STORE_PASSWORD')
+                keyAlias = System.getenv('STAR_COLLECT_KEY_ALIAS')
+                keyPassword = System.getenv('STAR_COLLECT_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            buildConfigField 'String', 'UPDATE_TEST_URL', '"' + (System.getenv('STAR_COLLECT_UPDATE_TEST_URL') ?: '').replace('"', '') + '"'
+        }
+        release {
+            signingConfig = signingConfigs.release
+            buildConfigField 'String', 'UPDATE_TEST_URL', '""'
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
